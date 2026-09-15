@@ -14,7 +14,7 @@
   --glass-shadow: 0 10px 30px 0 rgba(31, 38, 135, 0.2);
   --text-main: #1e293b;
   --text-muted: #64748b;
-  --bubble-size: 156px;
+  --bubble-size: 185px;
 }
 
 * {
@@ -430,7 +430,7 @@ body {
 .bubble-en {
   position: relative;
   z-index: 2;
-  font-size: clamp(23px, 2.4vw, 28px);
+  font-size: clamp(27px, 2.7vw, 34px);
   font-weight: 900;
   color: #0f172a;
   text-shadow:
@@ -453,7 +453,7 @@ body {
 /* 長單字微調字體大小 (如 supermarket, restaurant, breakfast, rectangle)，確保圓形泡泡內單行完整排版且不拆字斷行 */
 .bubble-word.compact-word,
 .bubble-en.compact-word {
-  font-size: clamp(17px, 1.55vw, 19.5px);
+  font-size: clamp(20px, 1.9vw, 24px);
   letter-spacing: -0.5px;
   line-height: 1.05;
   white-space: nowrap;
@@ -476,25 +476,25 @@ body {
 
 .slot-top-left {
   top: 18%;
-  left: 14%;
+  left: 10%;
   animation-delay: -0.8s;
 }
 
 .slot-bottom-left {
   bottom: 18%;
-  left: 14%;
+  left: 10%;
   animation-delay: -3.1s;
 }
 
 .slot-top-right {
   top: 18%;
-  right: 14%;
+  right: 10%;
   animation-delay: -1.5s;
 }
 
 .slot-bottom-right {
   bottom: 18%;
-  right: 14%;
+  right: 10%;
   animation-delay: -3.8s;
 }
 
@@ -551,8 +551,28 @@ body {
   80% { transform: translateX(8px); }
 }
 
-.popping {
-  pointer-events: none;
+.word-bubble.popping {
+  pointer-events: none !important;
+  animation: bubblePopBurst 0.22s cubic-bezier(0.1, 0.9, 0.2, 1) forwards !important;
+}
+
+@keyframes bubblePopBurst {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+    filter: brightness(1);
+  }
+  40% {
+    transform: scale(1.38);
+    opacity: 0.9;
+    filter: brightness(2.2) drop-shadow(0 0 25px rgba(255, 255, 255, 0.9));
+  }
+  100% {
+    transform: scale(1.65);
+    opacity: 0;
+    filter: brightness(3);
+    visibility: hidden;
+  }
 }
 
 /* =========================================================
@@ -980,7 +1000,7 @@ body {
    ========================================================= */
 @media (max-width: 1024px) {
   :root {
-    --bubble-size: 126px;
+    --bubble-size: 155px;
   }
   .center-card {
     width: 190px;
@@ -993,16 +1013,16 @@ body {
     font-size: 17px;
   }
   .slot-top-left, .slot-bottom-left {
-    left: 8%;
+    left: 10%;
   }
   .slot-top-right, .slot-bottom-right {
-    right: 8%;
+    right: 10%;
   }
 }
 
 @media (max-width: 768px) {
   :root {
-    --bubble-size: 108px;
+    --bubble-size: 135px;
   }
   .top-hud {
     padding: 12px 16px;

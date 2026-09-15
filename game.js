@@ -529,6 +529,9 @@ class ESLBubbleGame {
         onBubbleHit: (wordId, x, y) => this.onBubbleHit(wordId, x, y),
         onStatusChange: (text) => this.showNotice(text)
       });
+      if (typeof this.handTracker.bindMouseAndTouch === "function") {
+        this.handTracker.bindMouseAndTouch(this.dom.stage);
+      }
     } else {
       this.handTracker = {
         cameraReady: false,
@@ -1067,13 +1070,17 @@ class ESLBubbleGame {
     const targetEl = this.dom.bubblesContainer.querySelector(`.word-bubble[data-word-id="${wordId}"]`);
     if (!targetEl || targetEl.classList.contains('popping')) return;
 
+    // 立即加上爆破狀態與動畫
     targetEl.classList.add('popping');
+    targetEl.style.pointerEvents = 'none';
+
+    // 播放爆破音效與單字發音
     window.soundSystem.playBubblePop();
     window.soundSystem.playWordAudio(wordId);
 
     const rect = targetEl.getBoundingClientRect();
-    const centerX = rect.left + rect.width / 2;
-    const centerY = rect.top + rect.height / 2;
+    const centerX = (hitX !== undefined && hitX > 0) ? hitX : (rect.left + rect.width / 2);
+    const centerY = (hitY !== undefined && hitY > 0) ? hitY : (rect.top + rect.height / 2);
 
     const isCorrect = (wordId === this.state.targetItem.id);
 
@@ -1089,6 +1096,7 @@ class ESLBubbleGame {
       const earnedScore = 100 + Math.min(150, (this.state.combo - 1) * 25);
       this.state.score += earnedScore;
 
+      // 爽快爆破金色粒子與浮動加分
       this.spawnPopParticles(centerX, centerY, true);
       this.showFloatingText(centerX, centerY, `+${earnedScore}`, '#10b981');
       setTimeout(() => window.soundSystem.playCorrect(), 80);
@@ -1096,10 +1104,15 @@ class ESLBubbleGame {
       this.updateHUD();
       this.showNotice(`太棒了！答對了：${this.state.targetItem.word} 🎉`);
 
+      // 泡泡爆破動畫結束後立即移除元素，畫面乾淨爽快！
+      setTimeout(() => {
+        if (targetEl && targetEl.parentNode) targetEl.remove();
+      }, 200);
+
       setTimeout(() => {
         this.state.isTransitioning = false;
         this.nextRound();
-      }, 700);
+      }, 650);
 
     } else {
       // 答錯邏輯
@@ -1107,6 +1120,7 @@ class ESLBubbleGame {
       this.state.wrongCount++;
       this.state.lives--;
 
+      // 錯誤紅色爆破粒子
       this.spawnPopParticles(centerX, centerY, false);
       this.showFloatingText(centerX, centerY, '錯囉!', '#ef4444');
       setTimeout(() => window.soundSystem.playWrong(), 60);
@@ -1118,17 +1132,21 @@ class ESLBubbleGame {
       const wrongItem = VOCABULARY.find(v => v.id === wordId);
       this.showNotice(`哎呀！那是 ${wrongItem ? wrongItem.word : wordId}，再找找看！`);
 
+      const slotIdx = parseInt(targetEl.dataset.slotIndex, 10);
+
+      // 錯誤泡泡也是立即破裂爆開並移除！
+      setTimeout(() => {
+        if (targetEl && targetEl.parentNode) targetEl.remove();
+      }, 200);
+
       if (this.state.lives <= 0) {
         this.endGame('愛心已扣完！挑戰結束。');
         return;
       }
 
-      // 若設定為補換泡泡
-      if (this.state.replaceOnWrong) {
-        const slotIdx = parseInt(targetEl.dataset.slotIndex, 10);
-        setTimeout(() => this.replaceBubble(slotIdx), 500);
-      } else {
-        targetEl.style.visibility = 'hidden';
+      // 若設定為補換泡泡，400ms 後新泡泡平滑補進
+      if (this.state.replaceOnWrong && !isNaN(slotIdx)) {
+        setTimeout(() => this.replaceBubble(slotIdx), 380);
       }
     }
   }
