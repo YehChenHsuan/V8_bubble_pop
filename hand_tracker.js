@@ -1,12 +1,4 @@
-/**
- * hand_tracker.js - ESL 視訊單字泡泡遊戲 體感手勢追蹤核心模組 (極速 60FPS 零延遲強化版)
- * 特色：
- * 1. MediaPipe Hands 輕量化神經網路 (modelComplexity: 0, 響應延遲 < 25ms)
- * 2. 60FPS 渲染非阻塞解耦架構 (requestAnimationFrame 不受推理等待影響)
- * 3. 全手部多點感應 (食指尖、中指尖、拇指尖、掌心、指節，多點即觸即破)
- * 4. 寬容度碰撞檢測 (半徑擴大 1.3 倍，揮手即可輕鬆破泡)
- * 5. 視訊 cover 鏡像對齊與 object-fit 像素補償
- */
+/** 食指指尖追蹤：所有泡泡採相同即時碰撞規則；實際延遲依設備與模型而異。 */
 
 class HandTracker {
   constructor(options = {}) {
@@ -16,6 +8,8 @@ class HandTracker {
     this.onBubbleHit = options.onBubbleHit || (() => {});
     this.statusCallback = options.onStatusChange || (() => {});
 
+    this.isPlaying = options.isPlaying || (() => true);
+    this.lastVideoTime = -1;
     this.stream = null;
     this.cameraReady = false;
     this.mediaPipeActive = false;
@@ -23,24 +17,17 @@ class HandTracker {
 
     // 手部資料
     this.hands = [];
-    this.lastHitTimes = new Map(); // 泡泡命中冷卻時間
 
     // 非阻塞推理旗標
     this.isProcessingMp = false;
-    this.lastMpProcessTime = 0;
-
-    // 動態差分備援 (僅在無 MediaPipe 時啟用)
-    this.motionCanvas = document.createElement('canvas');
-    this.motionCanvas.width = 160;
-    this.motionCanvas.height = 120;
-    this.motionCtx = this.motionCanvas.getContext('2d', { willReadFrequently: true });
-    this.prevFrameData = null;
+    this.inferenceToken = 0;
+    this.inferenceTimer = null;
+    this.nextInferenceAt = 0;
 
     // 動畫 frame handle
     this.animFrameId = null;
     this.mpHands = null;
 
-    this.motionThreshold = 28;
   }
 
   // 啟動攝影機與追蹤
@@ -51,6 +38,7 @@ class HandTracker {
         video: {
           width: { ideal: 960 },
           height: { ideal: 540 },
+          frameRate: { ideal: 30, max: 30 },
           facingMode: 'user'
         },
         audio: false
@@ -66,7 +54,7 @@ class HandTracker {
       // 初始化 MediaPipe Hands
       this.initMediaPipeHands();
 
-      // 啟動極速 60FPS 監控迴圈
+      // 啟動視訊新幀監控迴圈
       this.startLoop();
       return true;
     } catch (err) {
@@ -79,8 +67,9 @@ class HandTracker {
 
   // 初始化 MediaPipe Hands (使用 modelComplexity: 0 輕量版)
   initMediaPipeHands() {
+    if (this.mpHands) return;
     if (typeof window.Hands !== 'function') {
-      console.info('未載入 MediaPipe 函式庫，自動切換為高效率動態差分偵測');
+      this.statusCallback('手勢模型未載入，請使用滑鼠／觸控操作');
       return;
     }
 
@@ -89,7 +78,7 @@ class HandTracker {
         locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
       });
 
-      // 關鍵優化：modelComplexity: 0 為輕量極速模型，延遲大幅降低至 15~25ms
+      // 使用輕量模型；實際推論時間需於目標裝置量測
       this.mpHands.setOptions({
         maxNumHands: 2,
         modelComplexity: 0,
@@ -97,14 +86,16 @@ class HandTracker {
         minTrackingConfidence: 0.45
       });
 
+      const model = this.mpHands;
       this.mpHands.onResults((results) => {
+        if (this.mpHands !== model || !this.mediaPipeActive) return;
         this.handleMediaPipeResults(results);
       });
 
       this.mediaPipeActive = true;
-      this.statusCallback('AI 雙手體感已就緒！揮動雙手戳破泡泡');
+      this.statusCallback('AI 食指追蹤已啟用，請用食指指尖戳破泡泡');
     } catch (e) {
-      console.warn('MediaPipe 初始化失敗，使用動態差分:', e);
+      console.warn('MediaPipe 初始化失敗:', e);
       this.mediaPipeActive = false;
     }
   }
@@ -136,93 +127,71 @@ class HandTracker {
       offsetY = 0;
     }
 
-    return { containerW, containerH, renderedW, renderedH, offsetX, offsetY };
+    return { containerW, containerH, renderedW, renderedH, offsetX, offsetY, left: stageRect.left, top: stageRect.top };
   }
 
   // 將正規化相機座標 [0, 1] 轉換為舞台像素座標 (含鏡像與 cover 偏移補償)
-  mapNormalizedToStage(normX, normY) {
-    const { renderedW, renderedH, offsetX, offsetY } = this.getVideoRenderInfo();
+  mapNormalizedToStage(normX, normY, info = this.getVideoRenderInfo()) {
+    const { renderedW, renderedH, offsetX, offsetY, left, top } = info;
     return {
-      x: normX * renderedW + offsetX,
-      y: normY * renderedH + offsetY
+      x: normX * renderedW + offsetX + left,
+      y: normY * renderedH + offsetY + top
     };
   }
 
-  // 解析 MediaPipe 雙手偵測結果 (多關鍵點感應 + 低延遲平滑)
+  // 游標和碰撞都只使用食指指尖 (landmark 8)，不額外平滑或等待。
   handleMediaPipeResults(results) {
-    if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
-      if (this.mediaPipeActive) {
-        this.hands = [];
-        this.onHandMove([]);
-      }
-      return;
-    }
-
-    const currentHands = [];
-
-    results.multiHandLandmarks.forEach((landmarks, idx) => {
-      // 收集手部多個關鍵部位：食指尖(8)、中指尖(12)、拇指尖(4)、掌心(9)、指節(7)
-      const keyLandmarks = [
-        landmarks[8],  // 食指尖 (最主要戳擊點)
-        landmarks[12], // 中指尖
-        landmarks[4],  // 拇指尖
-        landmarks[9],  // 掌心 (中指 MCP)
-        landmarks[7],  // 食指第二關節
-      ].filter(Boolean);
-
-      // 主要游標點（以食指尖為主，掌心為輔）
-      const mainPoint = landmarks[8] || landmarks[9] || landmarks[0];
-      const normMainX = this.isMirrored ? (1 - mainPoint.x) : mainPoint.x;
-      const { x: targetX, y: targetY } = this.mapNormalizedToStage(normMainX, mainPoint.y);
-
-      // 快速響應平滑濾波 (新座標權重 0.8，消除延遲手感)
-      const prevHand = this.hands.find(h => h.id === idx);
-      let smoothX = targetX;
-      let smoothY = targetY;
-
-      if (prevHand) {
-        smoothX = prevHand.x * 0.2 + targetX * 0.8;
-        smoothY = prevHand.y * 0.2 + targetY * 0.8;
-      }
-
-      currentHands.push({
-        id: idx,
-        x: smoothX,
-        y: smoothY,
-        normX: normMainX,
-        normY: mainPoint.y
-      });
-
-      // 對所有重要手部節點均進行碰撞測試（手指或掌心碰觸泡泡立即破裂！）
-      keyLandmarks.forEach(kp => {
-        const nx = this.isMirrored ? (1 - kp.x) : kp.x;
-        const { x: px, y: py } = this.mapNormalizedToStage(nx, kp.y);
-        this.checkBubbleCollisions(px, py);
-      });
+    if (!this.cameraReady || !this.isPlaying() || document.hidden) return;
+    const renderInfo = this.getVideoRenderInfo();
+    const targets = this.getCollisionTargets();
+    this.hands = (results.multiHandLandmarks || []).flatMap((landmarks, id) => {
+      const tip = landmarks[8];
+      if (!tip || !Number.isFinite(tip.x) || !Number.isFinite(tip.y)) return [];
+      const normX = this.isMirrored ? 1 - tip.x : tip.x;
+      const { x, y } = this.mapNormalizedToStage(normX, tip.y, renderInfo);
+      this.checkBubbleCollisions(x, y, targets);
+      return [{ id, x, y, normX, normY: tip.y }];
     });
-
-    this.hands = currentHands;
     this.onHandMove(this.hands);
   }
 
-  // 極速 60FPS 監控迴圈 (渲染與推理非阻塞完全解耦)
+  // 視訊新幀監控迴圈 (一次僅送出一幀，避免堆積)
   startLoop() {
+    if (this.animFrameId !== null) cancelAnimationFrame(this.animFrameId);
     const loop = (timestamp) => {
-      if (this.cameraReady && this.videoElement && this.videoElement.readyState >= 2) {
-        // MediaPipe 非同步背景送幀，不卡頓 60FPS 主渲染
+      if (!document.hidden && this.isPlaying() && this.cameraReady && this.videoElement && this.videoElement.readyState >= 2 && this.lastVideoTime !== this.videoElement.currentTime) {
+        // 只送最新視訊幀，不額外節流等待
         if (this.mediaPipeActive && this.mpHands) {
-          if (!this.isProcessingMp && (timestamp - this.lastMpProcessTime > 28)) {
+          if (!this.isProcessingMp && timestamp >= this.nextInferenceAt) {
+            this.lastVideoTime = this.videoElement.currentTime;
             this.isProcessingMp = true;
-            this.lastMpProcessTime = timestamp;
-            this.mpHands.send({ image: this.videoElement })
-              .catch(() => {})
+            const token = ++this.inferenceToken;
+            const started = performance.now();
+            // 模型停滯時停止送幀，避免建立更多 GPU 工作或模型。
+            this.inferenceTimer = setTimeout(() => {
+              if (token !== this.inferenceToken) return;
+              this.disableTracking('手勢辨識逾時，請先使用滑鼠／觸控；重新整理可重啟鏡頭');
+            }, 8000);
+            Promise.resolve().then(() => this.mpHands.send({ image: this.videoElement }))
+              .catch(err => {
+                if (token !== this.inferenceToken) return;
+                console.warn('手勢模型失敗', err);
+                this.disableTracking('手勢模型無法使用，請使用滑鼠／觸控操作');
+              })
               .finally(() => {
+                if (token !== this.inferenceToken) return;
+                clearTimeout(this.inferenceTimer);
+                this.inferenceTimer = null;
                 this.isProcessingMp = false;
+                // 上限約 24 次／秒；慢裝置在推論後保留短暫繪圖時間。
+                const duration = performance.now() - started;
+                this.nextInferenceAt = performance.now() + Math.max(8, 1000 / 24 - duration);
               });
           }
         } else if (!this.mediaPipeActive) {
-          // 僅在無 MediaPipe 時啟用動態差分備援
-          this.processMotionDifferencing();
+          // 模型不可用時清空游標，使用滑鼠／觸控備援
+          this.hands = [];
+          this.onHandMove([]);
         }
       }
 
@@ -232,95 +201,49 @@ class HandTracker {
     this.animFrameId = requestAnimationFrame(loop);
   }
 
-  // 像素差異動態感應 (僅作為無 MediaPipe 時之極限備援)
-  processMotionDifferencing() {
-    if (!this.videoElement || this.videoElement.paused || this.videoElement.ended) return;
-
-    const w = this.motionCanvas.width;
-    const h = this.motionCanvas.height;
-
-    this.motionCtx.drawImage(this.videoElement, 0, 0, w, h);
-    const currentFrame = this.motionCtx.getImageData(0, 0, w, h);
-    const curr = currentFrame.data;
-
-    if (!this.prevFrameData) {
-      this.prevFrameData = curr;
-      return;
-    }
-
-    const prev = this.prevFrameData;
-    let motionCount = 0;
-    let sumX = 0;
-    let sumY = 0;
-
-    for (let y = 0; y < h; y += 3) {
-      for (let x = 0; x < w; x += 3) {
-        const i = (y * w + x) * 4;
-        const diff = Math.abs(curr[i] - prev[i]) +
-                     Math.abs(curr[i + 1] - prev[i + 1]) +
-                     Math.abs(curr[i + 2] - prev[i + 2]);
-
-        if (diff > this.motionThreshold * 3) {
-          const normX = this.isMirrored ? (1 - x / w) : (x / w);
-          const normY = y / h;
-          const { x: stageX, y: stageY } = this.mapNormalizedToStage(normX, normY);
-
-          sumX += stageX;
-          sumY += stageY;
-          motionCount++;
-        }
-      }
-    }
-
-    this.prevFrameData = curr;
-
-    if (motionCount >= 25) {
-      const avgX = sumX / motionCount;
-      const avgY = sumY / motionCount;
-      this.hands = [{ id: 0, x: avgX, y: avgY, isMotionCentroid: true }];
-      this.onHandMove(this.hands);
-      this.checkBubbleCollisions(avgX, avgY);
-    }
+  disableTracking(message) {
+    ++this.inferenceToken;
+    clearTimeout(this.inferenceTimer);
+    this.inferenceTimer = null;
+    this.isProcessingMp = false;
+    this.mediaPipeActive = false;
+    this.hands = [];
+    this.onHandMove([]);
+    this.statusCallback(message);
   }
 
   // 泡泡碰撞檢測 (大幅擴大感應半徑，輕觸即破)
-  checkBubbleCollisions(handX, handY) {
-    const stageRect = this.stageElement.getBoundingClientRect();
-    const bubbleElements = document.querySelectorAll('.word-bubble:not(.popping)');
-
-    bubbleElements.forEach(el => {
+  getCollisionTargets() {
+    return Array.from(this.stageElement.querySelectorAll('.word-bubble:not(.popping)'), el => {
       const rect = el.getBoundingClientRect();
-      const bX = rect.left - stageRect.left + rect.width / 2;
-      const bY = rect.top - stageRect.top + rect.height / 2;
-      // 擴大碰撞半徑至泡泡半徑 + 28px 緩衝區，感應極其靈敏爽快！
-      const radius = (rect.width / 2) + 28;
-
-      const dx = handX - bX;
-      const dy = handY - bY;
-      const distSq = dx * dx + dy * dy;
-
-      if (distSq <= radius * radius) {
-        this.triggerBubbleHit(el.dataset.wordId, bX, bY);
-      }
+      return { el, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, radius: rect.width / 2 + 28 };
     });
   }
 
-  // 觸發泡泡命中 (冷卻縮短至 260ms，響應更靈敏)
-  triggerBubbleHit(wordId, hitX, hitY) {
-    const now = performance.now();
-    const lastHit = this.lastHitTimes.get(wordId) || 0;
-    if (now - lastHit < 260) return;
+  checkBubbleCollisions(handX, handY, targets = this.getCollisionTargets()) {
+    if (!this.isPlaying()) return;
+    for (const target of targets) {
+      if (target.el.classList.contains('popping')) continue;
+      const dx = handX - target.x;
+      const dy = handY - target.y;
+      if (dx * dx + dy * dy <= target.radius * target.radius) {
+        this.triggerBubbleHit(target.el, target.x, target.y);
+      }
+    }
+  }
 
-    this.lastHitTimes.set(wordId, now);
-    this.onBubbleHit(wordId, hitX, hitY);
+  triggerBubbleHit(el, hitX, hitY) {
+    if (!this.isPlaying() || el.classList.contains('popping')) return;
+    // DOM 本身的 popping 狀態去重，不讓上一顆同名泡泡鎖住新泡泡。
+    this.onBubbleHit(el.dataset.wordId, hitX, hitY, el);
   }
 
   // 滑鼠 / 觸控點擊相容
   bindMouseAndTouch(stage) {
     stage.addEventListener('pointerdown', (e) => {
-      const rect = this.stageElement.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
+      if (!this.isPlaying()) return;
+      const x = e.clientX;
+      const y = e.clientY;
 
       this.hands = [{ id: 'pointer', x, y }];
       this.onHandMove(this.hands);
@@ -328,14 +251,14 @@ class HandTracker {
       const targetBubble = e.target.closest('.word-bubble');
       if (targetBubble && !targetBubble.classList.contains('popping')) {
         const wordId = targetBubble.dataset.wordId;
-        this.triggerBubbleHit(wordId, x, y);
+        this.triggerBubbleHit(targetBubble, x, y);
       }
     });
 
     stage.addEventListener('pointermove', (e) => {
-      const rect = this.stageElement.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
+      if (!this.isPlaying()) return;
+      const x = e.clientX;
+      const y = e.clientY;
       this.hands = [{ id: 'pointer', x, y }];
       this.onHandMove(this.hands);
     });
@@ -352,6 +275,10 @@ class HandTracker {
       this.stream = null;
     }
     this.cameraReady = false;
+    this.hands = [];
+    this.onHandMove([]);
+    this.lastVideoTime = -1;
+    this.nextInferenceAt = 0;
   }
 }
 

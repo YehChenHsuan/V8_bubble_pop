@@ -440,7 +440,9 @@ class ESLBubbleGame {
       wrongCount: 0,
       replaceOnWrong: true,   // 答錯時是否補換新泡泡
       targetItem: null,       // 當前出題的單字物件
-      currentBubbleWords: [], // 當前場上的 6 個單字 ID
+      currentBubbleWords: [], // 六個固定位置中放五顆泡泡，空位為 null
+      previousCorrectSlot: null,
+      emptySlot: null,
       questionHistory: [],    // 出題防連跳
       isTransitioning: false,
       selectedWordIds: []     // 玩家自訂勾選之單字清單 (最少 6 個)
@@ -458,6 +460,12 @@ class ESLBubbleGame {
 
     // 定時器
     this.gameTimer = null;
+    this.roundVersion = 0;
+    this.roundTimers = new Set();
+    this.pausedActions = [];
+    this.fxFrame = null;
+    this.fxLastTime = 0;
+    this.fxRender = ts => this.renderFxLoop(ts);
     this.lastTimestamp = performance.now();
 
     // DOM 快取
@@ -526,7 +534,8 @@ class ESLBubbleGame {
         videoElement: document.getElementById('webcam-video'),
         stageElement: this.dom.stage,
         onHandMove: (hands) => this.onHandMove(hands),
-        onBubbleHit: (wordId, x, y) => this.onBubbleHit(wordId, x, y),
+        onBubbleHit: (wordId, x, y, el) => this.onBubbleHit(wordId, x, y, el),
+        isPlaying: () => this.state.mode === 'playing' && !this.state.isTransitioning,
         onStatusChange: (text) => this.showNotice(text)
       });
       if (typeof this.handTracker.bindMouseAndTouch === "function") {
@@ -540,7 +549,7 @@ class ESLBubbleGame {
           stage.addEventListener('pointerdown', (e) => {
             const target = e.target.closest('.word-bubble');
             if (target && !target.classList.contains('popping')) {
-              this.onBubbleHit(target.dataset.wordId, e.clientX, e.clientY);
+              this.onBubbleHit(target.dataset.wordId, e.clientX, e.clientY, target);
             }
           });
         },
@@ -563,7 +572,7 @@ class ESLBubbleGame {
     this.bindEvents();
 
     // 啟動粒子循環
-    requestAnimationFrame((ts) => this.renderFxLoop(ts));
+    this.requestFx();
 
     // 暴露供測試介面
     window.eslGame = this;
@@ -889,12 +898,9 @@ class ESLBubbleGame {
     this.dom.submitScoreBtn.addEventListener('click', () => this.submitScore());
 
     // 10. 點擊/觸控泡泡作答備援
-    this.dom.stage.addEventListener('pointerdown', (e) => {
-      const target = e.target.closest('.word-bubble');
-      if (target && !target.classList.contains('popping')) {
-        this.onBubbleHit(target.dataset.wordId, e.clientX, e.clientY);
-      }
-    });
+    if (typeof HandTracker === 'undefined' && !window.HandTracker) {
+      this.handTracker.bindMouseAndTouch(this.dom.stage);
+    }
   }
 
   // 開始新遊戲
@@ -905,6 +911,10 @@ class ESLBubbleGame {
       return;
     }
 
+    this.clearRoundActions();
+    const startVersion = this.roundVersion;
+    this.handTracker.stop();
+    this.dom.timerDisplay.classList.remove('urgent');
     this.state.mode = 'playing';
     this.state.gameMode = this.dom.gameModeSelect.value;
     this.state.replaceOnWrong = (this.dom.wrongBubbleBehavior.value === 'replace');
@@ -917,6 +927,8 @@ class ESLBubbleGame {
     this.state.maxLives = 5;
     this.state.questionHistory = [];
     this.state.isTransitioning = false;
+    this.state.previousCorrectSlot = null;
+    this.state.emptySlot = null;
 
     if (this.state.gameMode === 'timed') {
       const timeVal = parseInt(this.dom.customTimeInput.value, 10) || 60;
@@ -941,6 +953,10 @@ class ESLBubbleGame {
     // 初始化攝影機
     if (this.dom.cameraToggle.checked) {
       await this.handTracker.initCamera();
+      if (startVersion !== this.roundVersion || this.state.mode !== 'playing') {
+        this.handTracker.stop();
+        return;
+      }
       this.handTracker.isMirrored = this.dom.mirrorToggle.checked;
     }
 
@@ -987,6 +1003,7 @@ class ESLBubbleGame {
   nextRound() {
     if (this.state.mode !== 'playing') return;
 
+    this.clearRoundActions();
     const target = this.pickTargetItem();
     this.state.targetItem = target;
 
@@ -998,7 +1015,7 @@ class ESLBubbleGame {
     this.animateCardPop();
     window.soundSystem.playWordAudio(target.id);
 
-    // 環繞生成 6 顆泡泡
+    // 五顆全新泡泡，上一題答對的位置保持空白。
     const roundWords = this.generateRoundBubbleWords(target);
     this.state.currentBubbleWords = roundWords;
     this.renderBubbles(roundWords);
@@ -1023,26 +1040,27 @@ class ESLBubbleGame {
     return picked;
   }
 
-  // 生成環繞的 6 顆泡泡單字清單 (1 正確 + 5 干擾)
+  // 六個位置放五顆泡泡 (1 正確 + 4 干擾)，保留上一題答對的空位。
   generateRoundBubbleWords(target) {
     const otherCandidates = this.activeVocabulary.filter(item => item.id !== target.id);
     const shuffledOthers = [...otherCandidates].sort(() => 0.5 - Math.random());
-    const distractors = shuffledOthers.slice(0, 5).map(item => item.id);
-
-    // 補足至 5 顆 (若所選單字剛好 6 個)
-    while (distractors.length < 5) {
-      distractors.push(this.activeVocabulary[Math.floor(Math.random() * this.activeVocabulary.length)].id);
+    const words = [target.id, ...shuffledOthers.slice(0, 4).map(item => item.id)];
+    for (let i = words.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [words[i], words[j]] = [words[j], words[i]];
     }
-
-    const sixWords = [target.id, ...distractors];
-    return sixWords.sort(() => 0.5 - Math.random());
+    const emptySlot = this.state.previousCorrectSlot ?? Math.floor(Math.random() * BUBBLE_SLOT_CLASSES.length);
+    this.state.emptySlot = emptySlot;
+    let wordIndex = 0;
+    return BUBBLE_SLOT_CLASSES.map((_, slot) => slot === emptySlot ? null : words[wordIndex++]);
   }
 
-  // 動態排布渲染 6 顆單字泡泡
+  // 固定位置渲染五顆泡泡，不壓縮空位。
   renderBubbles(wordIds) {
     this.dom.bubblesContainer.innerHTML = '';
 
     wordIds.forEach((wordId, index) => {
+      if (wordId === null) return;
       const slotClass = BUBBLE_SLOT_CLASSES[index] || 'slot-top';
       const itemData = VOCABULARY.find(v => v.id === wordId) || { word: wordId };
 
@@ -1064,11 +1082,15 @@ class ESLBubbleGame {
   }
 
   // 泡泡被戳破判定 (手勢或觸控)
-  onBubbleHit(wordId, hitX, hitY) {
+  onBubbleHit(wordId, hitX, hitY, hitElement = null) {
     if (this.state.mode !== 'playing' || this.state.isTransitioning) return;
 
-    const targetEl = this.dom.bubblesContainer.querySelector(`.word-bubble[data-word-id="${wordId}"]`);
-    if (!targetEl || targetEl.classList.contains('popping')) return;
+    const targetEl = hitElement || this.dom.bubblesContainer.querySelector(`.word-bubble[data-word-id="${wordId}"]`);
+    if (!targetEl || !this.dom.bubblesContainer.contains(targetEl) || targetEl.classList.contains('popping')) return;
+    const rect = targetEl.getBoundingClientRect();
+    const transform = getComputedStyle(targetEl).transform;
+    targetEl.style.setProperty('--pop-transform', transform === 'none' ? 'matrix(1,0,0,1,0,0)' : transform);
+    this.state.currentBubbleWords[Number(targetEl.dataset.slotIndex)] = null;
 
     // 立即加上爆破狀態與動畫
     targetEl.classList.add('popping');
@@ -1078,13 +1100,13 @@ class ESLBubbleGame {
     window.soundSystem.playBubblePop();
     window.soundSystem.playWordAudio(wordId);
 
-    const rect = targetEl.getBoundingClientRect();
     const centerX = (hitX !== undefined && hitX > 0) ? hitX : (rect.left + rect.width / 2);
     const centerY = (hitY !== undefined && hitY > 0) ? hitY : (rect.top + rect.height / 2);
 
     const isCorrect = (wordId === this.state.targetItem.id);
 
     if (isCorrect) {
+      this.state.previousCorrectSlot = Number(targetEl.dataset.slotIndex);
       // 答對邏輯
       this.state.isTransitioning = true;
       this.state.combo++;
@@ -1099,17 +1121,17 @@ class ESLBubbleGame {
       // 爽快爆破金色粒子與浮動加分
       this.spawnPopParticles(centerX, centerY, true);
       this.showFloatingText(centerX, centerY, `+${earnedScore}`, '#10b981');
-      setTimeout(() => window.soundSystem.playCorrect(), 80);
+      this.scheduleRoundAction(() => window.soundSystem.playCorrect(), 80);
 
       this.updateHUD();
       this.showNotice(`太棒了！答對了：${this.state.targetItem.word} 🎉`);
 
       // 泡泡爆破動畫結束後立即移除元素，畫面乾淨爽快！
-      setTimeout(() => {
+      this.scheduleRoundAction(() => {
         if (targetEl && targetEl.parentNode) targetEl.remove();
-      }, 200);
+      }, 240);
 
-      setTimeout(() => {
+      this.scheduleRoundAction(() => {
         this.state.isTransitioning = false;
         this.nextRound();
       }, 650);
@@ -1123,7 +1145,7 @@ class ESLBubbleGame {
       // 錯誤紅色爆破粒子
       this.spawnPopParticles(centerX, centerY, false);
       this.showFloatingText(centerX, centerY, '錯囉!', '#ef4444');
-      setTimeout(() => window.soundSystem.playWrong(), 60);
+      this.scheduleRoundAction(() => window.soundSystem.playWrong(), 60);
 
       this.updateHUD();
       this.renderHearts();
@@ -1135,9 +1157,9 @@ class ESLBubbleGame {
       const slotIdx = parseInt(targetEl.dataset.slotIndex, 10);
 
       // 錯誤泡泡也是立即破裂爆開並移除！
-      setTimeout(() => {
+      this.scheduleRoundAction(() => {
         if (targetEl && targetEl.parentNode) targetEl.remove();
-      }, 200);
+      }, 240);
 
       if (this.state.lives <= 0) {
         this.endGame('愛心已扣完！挑戰結束。');
@@ -1146,14 +1168,15 @@ class ESLBubbleGame {
 
       // 若設定為補換泡泡，400ms 後新泡泡平滑補進
       if (this.state.replaceOnWrong && !isNaN(slotIdx)) {
-        setTimeout(() => this.replaceBubble(slotIdx), 380);
+        this.scheduleRoundAction(() => this.replaceBubble(slotIdx), 380);
       }
     }
   }
 
   // 答錯後隨機補一顆新備選泡泡
   replaceBubble(slotIndex) {
-    if (this.state.mode !== 'playing') return;
+    if (slotIndex === this.state.emptySlot) return;
+    if (this.state.mode !== 'playing' || this.state.isTransitioning || this.state.currentBubbleWords[slotIndex] !== null) return;
 
     let availablePool = this.activeVocabulary.filter(item => 
       !this.state.currentBubbleWords.includes(item.id) &&
@@ -1161,7 +1184,7 @@ class ESLBubbleGame {
     );
 
     if (availablePool.length === 0) {
-      availablePool = this.activeVocabulary.filter(item => item.id !== this.state.targetItem.id);
+      return; // 等其他已破泡泡釋出單字，避免重複選項。
     }
 
     if (availablePool.length === 0) return;
@@ -1188,6 +1211,24 @@ class ESLBubbleGame {
     this.dom.bubblesContainer.appendChild(bubble);
   }
 
+  clearRoundActions() {
+    this.roundVersion++;
+    this.roundTimers.forEach(id => clearTimeout(id));
+    this.roundTimers.clear();
+    this.pausedActions.length = 0;
+  }
+
+  scheduleRoundAction(action, delay) {
+    const version = this.roundVersion;
+    const run = () => {
+      if (version !== this.roundVersion) return;
+      if (this.state.mode === 'paused') this.pausedActions.push(run);
+      else if (this.state.mode === 'playing') action();
+    };
+    const id = setTimeout(() => { this.roundTimers.delete(id); run(); }, delay);
+    this.roundTimers.add(id);
+  }
+
   // 暫停遊戲
   pauseGame() {
     if (this.state.mode !== 'playing') return;
@@ -1200,10 +1241,13 @@ class ESLBubbleGame {
     if (this.state.mode !== 'paused') return;
     this.state.mode = 'playing';
     this.dom.pauseModal.hidden = true;
+    const pending = this.pausedActions.splice(0);
+    pending.forEach(action => action());
   }
 
   // 回到首頁主選單
   returnToHome() {
+    this.clearRoundActions();
     this.state.mode = 'menu';
     if (this.gameTimer) clearInterval(this.gameTimer);
     if (this.handTracker) this.handTracker.stop();
@@ -1216,6 +1260,7 @@ class ESLBubbleGame {
 
   // 結束遊戲與結算
   endGame(reason) {
+    this.clearRoundActions();
     this.state.mode = 'gameover';
     if (this.gameTimer) clearInterval(this.gameTimer);
     if (this.handTracker) this.handTracker.stop();
@@ -1380,6 +1425,9 @@ class ESLBubbleGame {
 
   // 手勢光軌反饋
   onHandMove(hands) {
+    if (this.state.mode !== 'playing') return;
+    this.requestFx();
+    if (this.handTrails.length > 80) this.handTrails.splice(0, this.handTrails.length - 80);
     hands.forEach(h => {
       this.handTrails.push({
         x: h.x,
@@ -1393,6 +1441,8 @@ class ESLBubbleGame {
 
   // 產生爆破粒子
   spawnPopParticles(x, y, isCorrect) {
+    this.requestFx();
+    if (this.particles.length > 240) this.particles.splice(0, this.particles.length - 240);
     const count = isCorrect ? 36 : 18;
     for (let i = 0; i < count; i++) {
       const angle = Math.random() * Math.PI * 2;
@@ -1433,16 +1483,24 @@ class ESLBubbleGame {
     }
   }
 
+  requestFx() {
+    if (this.fxFrame !== null) return;
+    this.fxFrame = requestAnimationFrame(this.fxRender);
+  }
+
   // 粒子系統動畫循環
   renderFxLoop(ts) {
+    this.fxFrame = null;
+    const step = this.fxLastTime ? Math.min(3, (ts - this.fxLastTime) / (1000 / 60)) : 1;
+    this.fxLastTime = ts;
     const ctx = this.fxCtx;
     ctx.clearRect(0, 0, this.fxCanvas.width, this.fxCanvas.height);
 
     // 1. 繪製手勢光軌
     for (let i = this.handTrails.length - 1; i >= 0; i--) {
       const t = this.handTrails[i];
-      t.alpha -= 0.05;
-      t.radius *= 0.95;
+      t.alpha -= 0.05 * step;
+      t.radius *= Math.pow(0.95, step);
 
       if (t.alpha <= 0 || t.radius < 1) {
         this.handTrails.splice(i, 1);
@@ -1463,10 +1521,10 @@ class ESLBubbleGame {
     // 2. 繪製物理粒子
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
-      p.x += p.vx;
-      p.y += p.vy;
-      p.vy += 0.18; // 重力加速度
-      p.alpha -= p.decay;
+      p.x += p.vx * step;
+      p.y += p.vy * step;
+      p.vy += 0.18 * step; // 重力加速度
+      p.alpha -= p.decay * step;
 
       if (p.alpha <= 0) {
         this.particles.splice(i, 1);
@@ -1484,7 +1542,7 @@ class ESLBubbleGame {
         ctx.shadowBlur = 8;
         ctx.fill();
       } else if (p.type === 'star') {
-        p.rot += p.vRot;
+        p.rot += p.vRot * step;
         ctx.translate(p.x, p.y);
         ctx.rotate(p.rot);
         ctx.fillStyle = p.color;
@@ -1497,7 +1555,8 @@ class ESLBubbleGame {
       ctx.restore();
     }
 
-    requestAnimationFrame((ts) => this.renderFxLoop(ts));
+    if (this.particles.length || this.handTrails.length) this.requestFx();
+    else this.fxLastTime = 0;
   }
 
   // 繪製五角星路徑

@@ -11,6 +11,7 @@ class SoundSystem {
     this.bgmPlaying = false;
     this.bgmTimer = null;
     this.audioCache = new Map();
+    this.voiceVersion = 0;
   }
 
   // 初始化 Web Audio Context（需在使用者點擊或互動後觸發）
@@ -36,94 +37,63 @@ class SoundSystem {
     return this.isMuted;
   }
 
-  // 播放教材真人發音 MP3（支援空白檔名編碼與降級 TTS）
-  playWordAudio(wordId, onEnded = null) {
-    if (this.isMuted) {
-      if (onEnded) setTimeout(onEnded, 300);
-      return;
-    }
-
+  // 每次播放最多嘗試本目錄及父目錄一次，不循環重試。
+  playVoice(wordId, suffix, onEnded) {
+    const version = ++this.voiceVersion;
     if (this.currentVoice) {
+      this.currentVoice.onended = null;
+      this.currentVoice.onerror = null;
       this.currentVoice.pause();
-      this.currentVoice.currentTime = 0;
+      this.currentVoice.removeAttribute('src');
+      this.currentVoice.load();
+      this.currentVoice = null;
     }
-
-    // 處理空白檔名如 "wake up" -> "V8_wake%20up.mp3"
-    const fileName = `V8_${wordId}.mp3`;
-    const audioPath = `V8_flashcards_audios/${fileName}`;
-    const audio = new Audio(encodeURI(audioPath));
-    this.currentVoice = audio;
-
-    audio.onended = () => {
+    let finished = false;
+    const finish = () => {
+      if (finished || version !== this.voiceVersion) return;
+      finished = true;
       if (onEnded) onEnded();
     };
-
-    audio.onerror = () => {
-      // 嘗試備援父目錄路徑
-      const backupPath = `../V8_flashcards_audios/${fileName}`;
-      const backupAudio = new Audio(encodeURI(backupPath));
-      backupAudio.onended = () => { if (onEnded) onEnded(); };
-      backupAudio.onerror = () => {
-        console.warn(`無法載入語音檔案 ${audioPath}，改用語音合成 (TTS)`);
-        this.speakTTS(wordId, onEnded);
+    if (this.isMuted) { finish(); return; }
+    const file = `V8_${wordId}${suffix}.mp3`;
+    const paths = [`V8_flashcards_audios/${file}`, `../V8_flashcards_audios/${file}`];
+    const attempt = index => {
+      if (version !== this.voiceVersion) return;
+      if (index >= paths.length) {
+        console.warn('語音無法播放，已停止重試:', file);
+        finish();
+        return;
+      }
+      const audio = new Audio(encodeURI(paths[index]));
+      this.currentVoice = audio;
+      let handled = false;
+      const failed = () => {
+        if (handled || finished || version !== this.voiceVersion) return;
+        handled = true;
+        audio.onerror = audio.onended = null;
+        audio.pause();
+        audio.removeAttribute('src');
+        audio.load();
+        attempt(index + 1);
       };
-      backupAudio.play().catch(() => this.speakTTS(wordId, onEnded));
+      audio.onended = () => { if (!handled) { handled = true; finish(); } };
+      audio.onerror = failed;
+      audio.play().catch(failed);
     };
-
-    audio.play().catch(err => {
-      console.warn('音訊播放遭瀏覽器攔截，改用 TTS 或等待使用者互動:', err);
-      this.speakTTS(wordId, onEnded);
-    });
+    attempt(0);
   }
 
-  // 播放中文真人說明語音
+  playWordAudio(wordId, onEnded = null) {
+    this.playVoice(wordId, '', onEnded);
+  }
+
   playZhAudio(wordId, onEnded = null) {
-    if (this.isMuted) {
-      if (onEnded) setTimeout(onEnded, 300);
-      return;
-    }
-
-    if (this.currentVoice) {
-      this.currentVoice.pause();
-      this.currentVoice.currentTime = 0;
-    }
-
-    const fileName = `V8_${wordId}_zh.mp3`;
-    const audioPath = `V8_flashcards_audios/${fileName}`;
-    const audio = new Audio(encodeURI(audioPath));
-    this.currentVoice = audio;
-
-    audio.onended = () => {
-      if (onEnded) onEnded();
-    };
-
-    audio.onerror = () => {
-      const backupPath = `../V8_flashcards_audios/${fileName}`;
-      const backupAudio = new Audio(encodeURI(backupPath));
-      backupAudio.onended = () => { if (onEnded) onEnded(); };
-      backupAudio.play().catch(() => {
-        if (onEnded) setTimeout(onEnded, 300);
-      });
-    };
-
-    audio.play().catch(err => {
-      console.warn('中文音訊播放失敗:', err);
-      if (onEnded) setTimeout(onEnded, 300);
-    });
+    this.playVoice(wordId, '_zh', onEnded);
   }
 
-  // 徹底告別瀏覽器原生 TTS，優先回歸單字真人發音 MP3 播放
+  // 保留舊呼叫介面，使用有限次教材音檔播放。
   speakTTS(text, onEnded = null) {
-    if (this.isMuted) {
-      if (onEnded) setTimeout(onEnded, 300);
-      return;
-    }
-    const cleanWord = (text || '').trim();
-    if (cleanWord) {
-      this.playWordAudio(cleanWord, onEnded);
-    } else {
-      if (onEnded) setTimeout(onEnded, 300);
-    }
+    this.playWordAudio((text || '').trim(), onEnded);
   }
 
   // 擬真泡泡爆破音效 (Web Audio API 合成波)

@@ -4,8 +4,8 @@
    ========================================================= */
 
 :root {
-  --primary-color: #84cc16;
-  --primary-glow: rgba(132, 204, 22, 0.5);
+  --primary-color: #3b82f6;
+  --primary-glow: rgba(59, 130, 246, 0.5);
   --accent-gold: #f59e0b;
   --accent-green: #10b981;
   --accent-red: #ef4444;
@@ -558,17 +558,17 @@ body {
 
 @keyframes bubblePopBurst {
   0% {
-    transform: scale(1);
+    transform: var(--pop-transform) scale(1);
     opacity: 1;
     filter: brightness(1);
   }
   40% {
-    transform: scale(1.38);
+    transform: var(--pop-transform) scale(1.38);
     opacity: 0.9;
     filter: brightness(2.2) drop-shadow(0 0 25px rgba(255, 255, 255, 0.9));
   }
   100% {
-    transform: scale(1.65);
+    transform: var(--pop-transform) scale(1.65);
     opacity: 0;
     filter: brightness(3);
     visibility: hidden;
@@ -1274,3 +1274,6 @@ body {
   justify-content: space-between;
   gap: 12px;
 }
+
+/* 僅六顆泡泡建立合成層；保留原有光澤、模糊與爆破效果。 */
+.word-bubble { will-change: transform, opacity; touch-action: manipulation; }
